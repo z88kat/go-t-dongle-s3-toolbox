@@ -30,3 +30,9 @@
 *.exe
 *.out
 *.app
+
+# Compiled Dynamic libraries
+.pio
+.vscode
+.DS_Store
+src/os_config_copy.h
