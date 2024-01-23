@@ -6,3 +6,4 @@
 
 bool connect();
 void disconnect();
+void refreshTime();

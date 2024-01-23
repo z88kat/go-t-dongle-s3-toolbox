@@ -50,3 +50,10 @@ void disconnect() {
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
 }
+
+void refreshTime() {
+  Serial.println("Refreshing time");
+  connect();
+  configTime(GMT_OFFSET_SEC, DAY_LIGHT_OFFSET_SEC, NTP_SERVER1);
+  disconnect();
+}

@@ -1,4 +1,5 @@
 
+#include "AceButton.h"
 #include "ESP32Time.h"
 #include "os_config.h"
 #include "pin_config.h"
@@ -10,6 +11,9 @@
 #include <Preferences.h>
 #include <SPIFFS.h>
 #include <TFT_eSPI.h>
+
+using namespace ace_button;
+
 // ------------------------------------------------------------------------------------
 const int TFT_FONT = 4; // Font to use on the TFT
 const int BUF_SIZE = 80;
@@ -23,6 +27,27 @@ int black_width; // Width of the rectagle that needs to be cleared when stocks u
 ESP32Time rtc(0); // offset in seconds GMT+1
 
 Preferences preferences;
+
+AceButton button((uint8_t)PIN_KEY);
+
+void printMarketData(DynamicJsonDocument &doc);
+void handleButtonEvent(AceButton *button, uint8_t eventType, uint8_t buttonState);
+void buttonUpdateTask(void *pvParameters);
+
+// ------------------------------------------------------------------------------------
+
+// A structure that represents a stock quote with its value, previous close, change and if the market is open
+typedef struct {
+  double current;
+  double previousClose;
+  double percentageChange;
+  bool marketOpen;
+} quote;
+
+// We are going to have three stock quotes (S&P500, NASDAQ100 and T-Bill 10 years)
+quote spx, ndx, bnd;
+
+bool isDeviceReady = false;
 
 // ------------------------------------------------------------------------------------
 
@@ -52,6 +77,8 @@ void comma_separator(int num, char *str, char sep) {
 void setup() {
   // Serial port and TFT init
   Serial.begin(115200);
+  while (!Serial)
+    ;
   tft.init();
   tft.setTextFont(7);
   tft.fillRect(0, 0, TFT_WIDTH, TFT_HEIGHT, TFT_BLACK);
@@ -60,6 +87,7 @@ void setup() {
   pinMode(TFT_LEDA_PIN, OUTPUT);
   digitalWrite(TFT_LEDA_PIN, 0);
 
+  Serial.println("Initializing SPIFFS... please wait");
   if (!SPIFFS.begin(FORMAT_SPIFFS_IF_FAILED)) {
     Serial.println("SPIFFS Mount Failed");
   }
@@ -70,8 +98,35 @@ void setup() {
   Serial.println("I'm alive and well.");
   Serial.println("");
 
+  ButtonConfig *buttonConfig = button.getButtonConfig();
+  buttonConfig->setEventHandler(handleButtonEvent);
+  buttonConfig->setFeature(ButtonConfig::kFeatureClick);
+  buttonConfig->setFeature(ButtonConfig::kFeatureDoubleClick);
+  buttonConfig->setFeature(ButtonConfig::kFeatureLongPress);
+  //  buttonConfig->setClickDelay(200);
+  // buttonConfig->setDebounceDelay(10);
+  buttonConfig->setLongPressDelay(1000);
+
   // Configure the time
   configTime(GMT_OFFSET_SEC, DAY_LIGHT_OFFSET_SEC, nullptr);
+  refreshTime();
+
+  Serial.println("Restoring quotes from file");
+  File file = SPIFFS.open("/payload.json", FILE_READ);
+  if (!file) {
+    Serial.println("Failed to open file for reading");
+  } else {
+    String payload = file.readString();
+    // Try it again
+    DynamicJsonDocument doc(8192 * 4);
+    DeserializationError error = deserializeJson(doc, payload);
+    if (!error) {
+      printMarketData(doc);
+    } else {
+      Serial.println("Error deserializing data: ");
+      Serial.println(error.f_str());
+    }
+  }
 
   // Inital text screen setup
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -81,20 +136,21 @@ void setup() {
   tft.drawString("DJI", 0, tft.fontHeight(TFT_FONT) * 2, TFT_FONT);
   tft.setTextDatum(TR_DATUM);
   black_width = tft.textWidth("XXXXXXX");
+
+  // Listen for action on the user button (pin 35)
+  xTaskCreate(buttonUpdateTask, "ButtonUpdateTask", 10000, NULL, 1, NULL);
+
+  isDeviceReady = true;
 }
 
-// ------------------------------------------------------------------------------------
-
-// A structure that represents a stock quote with its value, previous close, change and if the market is open
-typedef struct {
-  double current;
-  double previousClose;
-  double percentageChange;
-  bool marketOpen;
-} quote;
-
-// We are going to have three stock quotes (S&P500, NASDAQ100 and T-Bill 10 years)
-quote spx, ndx, bnd;
+void buttonUpdateTask(void *pvParameters) {
+  while (1) {
+    button.check();
+    vTaskDelay(10);
+  }
+  Serial.println("Ending task 1");
+  vTaskDelete(NULL);
+}
 
 //
 // Use Yahoo Finance to get the relevant quotes from the internet
@@ -131,39 +187,37 @@ void getQuotes() {
     String payload = http.getString();
 
     // Save the payload to file storage
-    //    File file = SPIFFS.open("/payload.json", FILE_WRITE);
-    //    if (!file) {
-    //      Serial.println("Failed to open file for writing");
-    //    }
-
-    // Serial.println(payload);
+    File file = SPIFFS.open("/payload.json", FILE_WRITE);
+    if (file) {
+      file.println(payload);
+      file.close();
+    } else {
+      Serial.println("Failed to open file for writing");
+    }
 
     // Parse JSON data
     DynamicJsonDocument doc(8192 * 4);
     DeserializationError error = deserializeJson(doc, payload);
+
+    // Hmmm, error, lets read the file from SPIFFS
+    // This is handy when we have no network connection or yahoo kicks us out for the day
+    if (error) {
+      Serial.println("Error deserializing data: ");
+      Serial.println(error.f_str());
+      Serial.println("Reading from file");
+      File file = SPIFFS.open("/payload.json", FILE_READ);
+      if (!file) {
+        Serial.println("Failed to open file for reading");
+      } else {
+        String payload = file.readString();
+        // Try it again
+        error = deserializeJson(doc, payload);
+      }
+    }
+
+    // If we still have an error, we are done
     if (!error) {
-      Serial.println("--------------------------------------------");
-      spx.current = doc["quoteResponse"]["result"][0]["regularMarketPrice"];
-      spx.previousClose = doc["quoteResponse"]["result"][0]["regularMarketPreviousClose"];
-      spx.percentageChange = doc["quoteResponse"]["result"][0]["regularMarketChangePercent"];
-      spx.marketOpen = strcmp(doc["quoteResponse"]["result"][0]["marketState"], "REGULAR") == 0 ? true : false;
-
-      ndx.current = doc["quoteResponse"]["result"][1]["regularMarketPrice"];
-      ndx.previousClose = doc["quoteResponse"]["result"][1]["regularMarketPreviousClose"];
-      ndx.percentageChange = doc["quoteResponse"]["result"][1]["regularMarketChangePercent"];
-      ndx.marketOpen = strcmp(doc["quoteResponse"]["result"][1]["marketState"], "REGULAR") == 0 ? true : false;
-
-      bnd.current = doc["quoteResponse"]["result"][2]["regularMarketPrice"];
-      bnd.previousClose = doc["quoteResponse"]["result"][2]["regularMarketPreviousClose"];
-      bnd.percentageChange = doc["quoteResponse"]["result"][2]["regularMarketChangePercent"];
-      bnd.marketOpen = strcmp(doc["quoteResponse"]["result"][2]["marketState"], "REGULAR") == 0 ? true : false;
-
-      Serial.printf("S&P \t %8.1f from %8.1f \t (%+.1f%%) %s\n", spx.current, spx.previousClose, spx.percentageChange,
-                    spx.marketOpen ? "Open" : "Closed");
-      Serial.printf("GOL \t %8.1f from %8.1f \t (%+.1f%%) %s\n", ndx.current, ndx.previousClose, ndx.percentageChange,
-                    ndx.marketOpen ? "Open" : "Closed");
-      Serial.printf("DJI \t %8.1f from %8.1f \t (%+.1f%%) %s\n", bnd.current, bnd.previousClose, bnd.percentageChange,
-                    bnd.marketOpen ? "Open" : "Closed");
+      printMarketData(doc);
     } else {
       Serial.println("Error deserializing data: ");
       Serial.println(error.f_str());
@@ -178,6 +232,33 @@ void getQuotes() {
   http.end();
 
   disconnect();
+}
+
+/**
+ * Print the market data to the serial port
+ */
+void printMarketData(DynamicJsonDocument &doc) {
+  spx.current = doc["quoteResponse"]["result"][0]["regularMarketPrice"];
+  spx.previousClose = doc["quoteResponse"]["result"][0]["regularMarketPreviousClose"];
+  spx.percentageChange = doc["quoteResponse"]["result"][0]["regularMarketChangePercent"];
+  spx.marketOpen = strcmp(doc["quoteResponse"]["result"][0]["marketState"], "REGULAR") == 0 ? true : false;
+
+  ndx.current = doc["quoteResponse"]["result"][1]["regularMarketPrice"];
+  ndx.previousClose = doc["quoteResponse"]["result"][1]["regularMarketPreviousClose"];
+  ndx.percentageChange = doc["quoteResponse"]["result"][1]["regularMarketChangePercent"];
+  ndx.marketOpen = strcmp(doc["quoteResponse"]["result"][1]["marketState"], "REGULAR") == 0 ? true : false;
+
+  bnd.current = doc["quoteResponse"]["result"][2]["regularMarketPrice"];
+  bnd.previousClose = doc["quoteResponse"]["result"][2]["regularMarketPreviousClose"];
+  bnd.percentageChange = doc["quoteResponse"]["result"][2]["regularMarketChangePercent"];
+  bnd.marketOpen = strcmp(doc["quoteResponse"]["result"][2]["marketState"], "REGULAR") == 0 ? true : false;
+
+  Serial.printf("S&P \t %8.1f from %8.1f \t (%+.1f%%) %s\n", spx.current, spx.previousClose, spx.percentageChange,
+                spx.marketOpen ? "Open" : "Closed");
+  Serial.printf("GOL \t %8.1f from %8.1f \t (%+.1f%%) %s\n", ndx.current, ndx.previousClose, ndx.percentageChange,
+                ndx.marketOpen ? "Open" : "Closed");
+  Serial.printf("DJI \t %8.1f from %8.1f \t (%+.1f%%) %s\n", bnd.current, bnd.previousClose, bnd.percentageChange,
+                bnd.marketOpen ? "Open" : "Closed");
 }
 
 // Write a stock quote to the TFT screen at a certain vertical position.
@@ -225,6 +306,40 @@ void drawPercentChange(const quote &symbol, int pos) {
   tft.drawString(buf, TFT_HEIGHT, tft.fontHeight(TFT_FONT) * pos, TFT_FONT);
 }
 
+/**
+ * Start, Reset or Stop the focus timer
+ * This is actually little tricky because when the device is in deep sleep we need the button
+ * to wake up the device.
+ * This means that these events will not be triggered after the device is in deep sleep.
+ * The first click will wake up the device and the second click will trigger the event
+ */
+void handleButtonEvent(AceButton *button, uint8_t eventType, uint8_t buttonState) {
+  // sleepTimer = 0;
+
+  // Print out a message for all events.
+  Serial.print(F("handleEvent(): eventType: "));
+  Serial.print(eventType);
+  Serial.print(F("; buttonState: "));
+  Serial.println(buttonState);
+
+  switch (eventType) {
+  case AceButton::kEventClicked: {
+    Serial.println("Clicked");
+    break;
+  }
+
+    // Double click to reset the focus timer and start again from 5 minutes
+  case AceButton::kEventDoubleClicked:
+    Serial.println("Double Clicked, setting focus timer to 5 minutes");
+    break;
+
+    // Long press to turn off the focus timer
+  case AceButton::kEventLongPressed:
+    Serial.println("Long Pressed. disable focus timer");
+    break;
+  }
+}
+
 // Keep track of the last time we updated the quotes
 // Set the time to now ensures a firstime hit
 static unsigned long lastUpdate = (30 * 60 * 1000);
@@ -232,17 +347,24 @@ static unsigned long lastUpdate = (30 * 60 * 1000);
 // Main looop showing the quotes on the TFT screen
 void loop() {
 
+  if (!isDeviceReady) {
+    Serial.println("Device is not ready yet");
+    delay(500);
+    return;
+  }
+
   // Get the current minutes
-  // int currentMinutes = rtc.getMinute();
+  int currentMinutes = rtc.getMinute();
   // Get the current hour
-  // int currentHour = rtc.getHour(true);
+  int currentHour = rtc.getHour(true);
   // print the time
-  // Serial.printf("The current time is %02d:%02d\n", currentHour, currentMinutes);
+  Serial.printf("The current time is %02d:%02d\n", currentHour, currentMinutes);
 
   // Get the quotes from Yahoo every 30 minutes
   // Yahoo have daily hard limits on the number of requests per day to 100
   // Every 15 minutes is 96 times per day
-  if (millis() - lastUpdate > 30 * 60 * 1000) {
+  // during the hours 09:00 - 21:00
+  if ((millis() - lastUpdate > 30 * 60 * 1000) && (currentHour >= 9 && currentHour < 21)) {
     getQuotes();
     lastUpdate = millis();
   }

@@ -9,7 +9,8 @@
 #define DEVICE_NAME            "lily-dongle-s3"
 #define PREFS_KEY              "dongle-os"
 
-#define PIN_KEY                35
+// https://www.lilygo.cc/en-pl/products/t-dongle-s3
+#define PIN_KEY                0
 
 // Time Configuration
 #define NTP_SERVER1            "pool.ntp.org"
@@ -26,11 +27,3 @@
 #define WIFI_PASSWD            ""
 
 #define YAHOO_API_KEY          ""
-
-// Set your API Key according to https://openweathermap.org/api
-// Add the weather API key
-#define WEATHER_API_KEY       ""
-
-// Set your address according to https://openweathermap.org/find eg: London,UK
-// And the geo-location will be calculated automatically to set the weather for your location
-#define WEATHER_LOCATION   ""
