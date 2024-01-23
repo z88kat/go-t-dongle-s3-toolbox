@@ -1,14 +1,15 @@
 
-#include <Arduino.h>
-#include <ArduinoJson.h>
-#include <ESP_WiFiManager.h>
-#include <HTTPClient.h>
-#include <TFT_eSPI.h>
-#include <WiFi.h>
-
+#include "ESP32Time.h"
 #include "os_config.h"
 #include "pin_config.h"
-
+#include "wifi_manager.h"
+#include <Arduino.h>
+#include <ArduinoJson.h>
+#include <FS.h>
+#include <HTTPClient.h>
+#include <Preferences.h>
+#include <SPIFFS.h>
+#include <TFT_eSPI.h>
 // ------------------------------------------------------------------------------------
 const int TFT_FONT = 4; // Font to use on the TFT
 const int BUF_SIZE = 80;
@@ -16,6 +17,13 @@ const int DELAY = 2000; // Display things on the TFT for 2 seconds
 
 TFT_eSPI tft;    // The TFT object
 int black_width; // Width of the rectagle that needs to be cleared when stocks update
+
+// ESP32Time rtc;
+// ESP32Time rtc(GMT_OFFSET_SEC); // offset in seconds GMT+1
+ESP32Time rtc(0); // offset in seconds GMT+1
+
+Preferences preferences;
+
 // ------------------------------------------------------------------------------------
 
 // Given a number convert it to a thousands separated string using a specific separating character
@@ -52,46 +60,25 @@ void setup() {
   pinMode(TFT_LEDA_PIN, OUTPUT);
   digitalWrite(TFT_LEDA_PIN, 0);
 
+  if (!SPIFFS.begin(FORMAT_SPIFFS_IF_FAILED)) {
+    Serial.println("SPIFFS Mount Failed");
+  }
+
   // Write initial diagnose to serial port
   Serial.println("");
   Serial.println("Hello, this is T-Dongle-S3 providing stock market information.");
   Serial.println("I'm alive and well.");
   Serial.println("");
 
-  // Connect to Wi-Fi network
-  WiFi.mode(WIFI_STA);
-  WiFi.persistent(false);
-  WiFi.setTxPower(WIFI_POWER_2dBm); // REQUIRED otherwise WiFi does not work!
-  WiFi.hostname(DEVICE_NAME);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWD);
-
-  uint8_t i = 0;
-  // while (WiFi.localIP().toString() == "0.0.0.0" && i++ < 60) {
-  while (WiFi.status() != WL_CONNECTED && i++ < 60) { // Wait for the WiFI connection completion
-    delay(500);
-    Serial.print(".");
-    Serial.print(WiFi.status());
-  }
-
-  // The WiFi on this device fails all the time, it's completely random when it does or does not connect
-  // I have a connection success rate of 1:20
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Failed to connect to WiFi");
-    // disconnect WiFi as it's no longer needed
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
-  } else {
-
-    Serial.print("# IP address: ");
-    Serial.println(WiFi.localIP());
-  }
+  // Configure the time
+  configTime(GMT_OFFSET_SEC, DAY_LIGHT_OFFSET_SEC, nullptr);
 
   // Inital text screen setup
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextDatum(TL_DATUM);
-  tft.drawString("SPX", 0, 0, TFT_FONT);
+  tft.drawString("S&P", 0, 0, TFT_FONT);
   tft.drawString("NDX", 0, tft.fontHeight(TFT_FONT), TFT_FONT);
-  tft.drawString("T10", 0, tft.fontHeight(TFT_FONT) * 2, TFT_FONT);
+  tft.drawString("DJI", 0, tft.fontHeight(TFT_FONT) * 2, TFT_FONT);
   tft.setTextDatum(TR_DATUM);
   black_width = tft.textWidth("XXXXXXX");
 }
@@ -109,15 +96,30 @@ typedef struct {
 // We are going to have three stock quotes (S&P500, NASDAQ100 and T-Bill 10 years)
 quote spx, ndx, bnd;
 
+//
 // Use Yahoo Finance to get the relevant quotes from the internet
+// Keep in mind for the free version you have a 100 hard limit per day
 void getQuotes() {
+
+  // Connect to WiFi
+  bool isConnected = connect();
+
+  if (!isConnected) {
+    Serial.println("Failed to connect to WiFi. Will not get quotes.");
+    return;
+  }
 
   Serial.println("Getting quotes from Yahoo Finance");
   // Use Yahoo Finance API to get the current value of S&P500 and NASDAQ
   HTTPClient http;
 
+  // S&P == ^GSPC "%5EGSPC"
+  // NASDAQ == ^NDX "%5ENDX"
+  // Dow Jones == ^DJI "%5EDJI"
+  String symbols = "%5EGSPC%2C%5ENDX%2C%5EDJI";
+
   // "https://yfapi.net/v6/finance/quote?region=US&lang=en&symbols=SPX%2CGC%2CDJI"
-  String url = "https://yfapi.net/v6/finance/quote?region=US&lang=en&symbols=SPX%2CGC%2CDJI";
+  String url = "https://yfapi.net/v6/finance/quote?region=US&lang=en&symbols=" + symbols;
   // String url = "https://yfapi.net/v6/finance/quote/marketSummary?lang=en&region=US";
 
   http.begin(url);
@@ -127,6 +129,12 @@ void getQuotes() {
   int httpCode = http.GET();
   if (httpCode == HTTP_CODE_OK) {
     String payload = http.getString();
+
+    // Save the payload to file storage
+    //    File file = SPIFFS.open("/payload.json", FILE_WRITE);
+    //    if (!file) {
+    //      Serial.println("Failed to open file for writing");
+    //    }
 
     // Serial.println(payload);
 
@@ -138,21 +146,24 @@ void getQuotes() {
       spx.current = doc["quoteResponse"]["result"][0]["regularMarketPrice"];
       spx.previousClose = doc["quoteResponse"]["result"][0]["regularMarketPreviousClose"];
       spx.percentageChange = doc["quoteResponse"]["result"][0]["regularMarketChangePercent"];
-      spx.marketOpen = strcmp(doc["quoteResponse"]["result"][0]["marketState"], "REGULAR") == 0 ? "Closed" : "Open";
+      spx.marketOpen = strcmp(doc["quoteResponse"]["result"][0]["marketState"], "REGULAR") == 0 ? true : false;
 
       ndx.current = doc["quoteResponse"]["result"][1]["regularMarketPrice"];
       ndx.previousClose = doc["quoteResponse"]["result"][1]["regularMarketPreviousClose"];
       ndx.percentageChange = doc["quoteResponse"]["result"][1]["regularMarketChangePercent"];
-      ndx.marketOpen = strcmp(doc["quoteResponse"]["result"][1]["marketState"], "REGULAR") == 0 ? "Closed" : "Open";
+      ndx.marketOpen = strcmp(doc["quoteResponse"]["result"][1]["marketState"], "REGULAR") == 0 ? true : false;
 
       bnd.current = doc["quoteResponse"]["result"][2]["regularMarketPrice"];
       bnd.previousClose = doc["quoteResponse"]["result"][2]["regularMarketPreviousClose"];
       bnd.percentageChange = doc["quoteResponse"]["result"][2]["regularMarketChangePercent"];
-      bnd.marketOpen = strcmp(doc["quoteResponse"]["result"][2]["marketState"], "REGULAR") == 0 ? "Closed" : "Open";
+      bnd.marketOpen = strcmp(doc["quoteResponse"]["result"][2]["marketState"], "REGULAR") == 0 ? true : false;
 
-      Serial.printf("S&P \t %8.1f from %8.1f \t (%+.1f%%) %\n", spx.current, spx.previousClose, spx.percentageChange, spx.marketOpen);
-      Serial.printf("GOL \t %8.1f from %8.1f \t (%+.1f%%) %\n", ndx.current, ndx.previousClose, ndx.percentageChange, ndx.marketOpen);
-      Serial.printf("DJI \t %8.1f from %8.1f \t (%+.1f%%) %\n", bnd.current, bnd.previousClose, bnd.percentageChange, bnd.marketOpen);
+      Serial.printf("S&P \t %8.1f from %8.1f \t (%+.1f%%) %s\n", spx.current, spx.previousClose, spx.percentageChange,
+                    spx.marketOpen ? "Open" : "Closed");
+      Serial.printf("GOL \t %8.1f from %8.1f \t (%+.1f%%) %s\n", ndx.current, ndx.previousClose, ndx.percentageChange,
+                    ndx.marketOpen ? "Open" : "Closed");
+      Serial.printf("DJI \t %8.1f from %8.1f \t (%+.1f%%) %s\n", bnd.current, bnd.previousClose, bnd.percentageChange,
+                    bnd.marketOpen ? "Open" : "Closed");
     } else {
       Serial.println("Error deserializing data: ");
       Serial.println(error.f_str());
@@ -165,6 +176,8 @@ void getQuotes() {
   }
 
   http.end();
+
+  disconnect();
 }
 
 // Write a stock quote to the TFT screen at a certain vertical position.
@@ -187,15 +200,22 @@ void drawQuote(const quote &symbol, int pos, char sep) {
   tft.drawString(buf, TFT_HEIGHT, tft.fontHeight(TFT_FONT) * pos, TFT_FONT);
 }
 
+/**
+ * Write the percentage change of a stock to the TFT screen at a certain vertical position.
+ */
 void drawPercentChange(const quote &symbol, int pos) {
   // Set drawing colour according to market state and if the stock is up or down
   if (symbol.marketOpen == false) {
+    // Market is closed :-(
     tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
   } else if (symbol.percentageChange > 0.0) {
+    // Positive change in the stock price :-)
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
   } else if (abs(symbol.percentageChange) < 0.001) {
+    // No change in the stock price
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
   } else {
+    // Negative change in the stock price :-(
     tft.setTextColor(TFT_RED, TFT_BLACK);
   }
 
@@ -211,6 +231,13 @@ static unsigned long lastUpdate = (30 * 60 * 1000);
 
 // Main looop showing the quotes on the TFT screen
 void loop() {
+
+  // Get the current minutes
+  // int currentMinutes = rtc.getMinute();
+  // Get the current hour
+  // int currentHour = rtc.getHour(true);
+  // print the time
+  // Serial.printf("The current time is %02d:%02d\n", currentHour, currentMinutes);
 
   // Get the quotes from Yahoo every 30 minutes
   // Yahoo have daily hard limits on the number of requests per day to 100
